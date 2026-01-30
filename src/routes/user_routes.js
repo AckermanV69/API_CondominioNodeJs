@@ -3,6 +3,7 @@ import { Router } from "express";
 import { 
     usersget, 
     usersgetid, 
+    usersgetByEmail,
     usersdelete, 
     usersput, 
     loginUsuario, 
@@ -15,30 +16,32 @@ import {
     asignarUnidadPropietario,
     desvincularUnidad,
     getEstadosConCiudades,
-    asignarUnidadPorCorreo
+    asignarUnidadPorCorreo,
+    vincularUnidad,
+    asignarUnidad
 } from '../controllers/usercontroller.js';
 
 const router = Router();
 
 router.put("/usuarios/update-condominio", updateUsuarioCondominio);
+router.put("/usuarios/update-condominio", actualizarCondominioUsuario);
 router.post("/pagos/carga-comun", registrarCargaComun);
 router.post("/pagos/carga-especial", registrarCargaEspecial);
-router.post("/signup", signUpUsuario);
-router.put("/usuarios/update-condominio", actualizarCondominioUsuario);
 router.post("/pagos/carga-especial-unidad", registrarCargaEspecialUnidad);
 router.post("/unidades/asignar", asignarUnidadPropietario);
 router.post("/unidades/desvincular", desvincularUnidad);
 router.get("/unidades/usuario-completo/:correo", getEstadosConCiudades);
 router.put("/unidades/asignar-por-correo", asignarUnidadPorCorreo);
+router.post("/unidades/vincular", vincularUnidad);
+router.post("/unidades/asignar-unidad", asignarUnidad);
 
-// Rutas de Gestión de Usuarios
-router.get("/users", usersget);           // Obtener todos
-router.get("/users/:id", usersgetid);     // Obtener uno
-router.delete("/users/:id", usersdelete); // Eliminar
-router.put("/users/:id", usersput);       // Actualizar
+router.get("/users", usersget);
+router.get("/users/:id", usersgetid);
+router.get("/usuarios/:email", usersgetByEmail);
+router.delete("/users/:id", usersdelete);
+router.put("/users/:id", usersput);
 
-// Rutas de Autenticación (Las que usa tu App Móvil)
-router.post("/login", loginUsuario);      // Iniciar sesión
-router.post("/signup", signUpUsuario);    // Registrarse
+router.post("/login", loginUsuario);
+router.post("/signup", signUpUsuario);
 
 export default router;

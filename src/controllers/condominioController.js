@@ -1,32 +1,38 @@
-import { pool } from "../db.js";
+import { pool } from "../config/db.js";
 
-// ESTA ES LA QUE USA TU PANTALLA AddContom
 export const registrarCondominio = async (req, res) => {
-    const { nombre, estado, ciudad, direccion, unidades, correo } = req.body;
+    // Extraemos los datos que vienen del celular
+    const { nombre, unidades, direccion, adminEmail, estado, ciudad } = req.body;
+
     try {
-        const result = await pool.query(
-            `INSERT INTO condominios (
-                nombre, estado, ciudad, direccion, 
-                correo_administrador, correo_contacto, cantidad_unidades
-            ) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-            [nombre, estado, ciudad, direccion, correo, correo, unidades.length]
-        );
+        // Iniciamos una transacción (opcional pero recomendado para guardar unidades y condo juntos)
+        await pool.query('BEGIN');
 
-        const condoId = result.rows[0].id;
+        // 1. Insertar el condominio usando los nombres exactos de tus columnas
+        const queryCondo = `
+            INSERT INTO condominios (nombre, estado, ciudad, direccion, correo_administrador) 
+            VALUES ($1, $2, $3, $4, $5) RETURNING id`;
+        
+        const valuesCondo = [nombre, estado, ciudad, direccion, adminEmail];
+        const result = await pool.query(queryCondo, valuesCondo);
+        const condominioId = result.rows[0].id;
 
-        for (let u of unidades) {
-            const nombreUnidad = `T:${u.torre || ''} P:${u.piso || ''} A:${u.apto || ''}`;
-            await pool.query(
-                "INSERT INTO unidades (condominio_id, nombre_unidad) VALUES ($1, $2)",
-                [condoId, nombreUnidad]
-            );
+        // 2. Insertar las unidades vinculadas a ese ID
+        for (const unidad of unidades) {
+            const queryUnidad = `
+                INSERT INTO unidades (nombre_unidad, seccion, mt2, condominio_id) 
+                VALUES ($1, $2, $3, $4)`;
+            const nombreUnidad = unidad.numero || `${unidad.seccion || ''}-${unidad.mt2 || ''}`.trim() || 'N/A';
+            await pool.query(queryUnidad, [nombreUnidad, unidad.seccion || null, unidad.mt2 || null, condominioId]);
         }
 
-        res.status(201).json({ message: "¡Propiedad registrada exitosamente!", id: condoId });
+        await pool.query('COMMIT');
+        res.status(201).json({ message: "Condominio y unidades registrados con éxito", id: condominioId });
+
     } catch (error) {
+        await pool.query('ROLLBACK');
         console.error("DETALLE DEL ERROR:", error);
-        res.status(500).json({ message: "Error al guardar", error: error.message });
+        res.status(500).json({ error: "No se pudo registrar el condominio", detalle: error.message });
     }
 };
 

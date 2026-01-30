@@ -1,4 +1,4 @@
-import { pool } from "../db.js";
+import { pool } from "../config/db.js";
 
 // Obtener todos los usuarios
 export const usersget = async(req, res) => {
@@ -16,6 +16,24 @@ export const usersgetid = async(req, res) => {
         const { id } = req.params;
         const { rows } = await pool.query('SELECT * FROM usuarios WHERE id = $1', [id]);
         
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        }
+        res.json(rows[0]);
+    } catch (error) {
+        res.status(500).json({ error: 'Error al obtener el usuario' });
+    }
+}
+
+// Obtener usuario por correo (Frontend: AddPropietario)
+export const usersgetByEmail = async (req, res) => {
+    try {
+        const { email } = req.params;
+        const correo = (email || '').trim().toLowerCase();
+        const { rows } = await pool.query(
+            'SELECT id, nombre, correo, rol, condominio_id FROM usuarios WHERE correo = $1',
+            [correo]
+        );
         if (rows.length === 0) {
             return res.status(404).json({ error: 'Usuario no encontrado' });
         }
@@ -100,16 +118,16 @@ export const loginUsuario = async (req, res) => {
 };
 
 
-// Registro CORREGIDO
+// Registro CORREGIDO (Frontend: nombre, cedula, telefono, correo, password, rol, condominio_id)
 export const signUpUsuario = async (req, res) => {
-    const { nombre, cedula, correo, password, rol, telefono, deuda, condominio } = req.body;
+    const { nombre, cedula, correo, password, rol, telefono, deuda, condominio, condominio_id } = req.body;
+    const condId = condominio_id ?? condominio ?? null;
 
     try {
-        // Insertamos los datos en la tabla 'usuarios'
         const result = await pool.query(
-            `INSERT INTO usuarios (nombre, cedula, correo, password, rol, telefono, deuda, condominio) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-            [nombre, cedula, correo, password, rol, telefono, deuda, condominio]
+            `INSERT INTO usuarios (nombre, cedula, correo, password, rol, telefono, deuda, condominio_id) 
+             VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), $8) RETURNING *`,
+            [nombre?.trim(), cedula?.trim(), (correo || '').trim().toLowerCase(), password, (rol || 'propietario').toLowerCase(), telefono?.trim(), deuda, condId]
         );
 
         res.status(201).json({
@@ -118,12 +136,9 @@ export const signUpUsuario = async (req, res) => {
         });
     } catch (error) {
         console.error("Error en el registro:", error);
-        
-        // Manejo de errores de duplicados (Email o Cédula ya registrados)
         if (error.code === '23505') {
             return res.status(400).json({ message: "La cédula o el correo ya están registrados" });
         }
-        
         res.status(500).json({ message: "Error interno del servidor" });
     }
 };
@@ -401,5 +416,48 @@ export const asignarUnidadPorCorreo = async (req, res) => {
         res.status(200).json({ message: "Unidad asignada", unidad: result.rows[0] });
     } catch (error) {
         res.status(500).json({ error: error.message });
+    }
+};
+
+// En tu controlador de vinculación (ej: usercontroller.js o unidadescontroller.js)
+export const vincularUnidad = async (req, res) => {
+    const { correo, unidad_id } = req.body;
+    try {
+        // 1. Buscar el ID del usuario por su correo
+        const userRes = await pool.query('SELECT id FROM usuarios WHERE correo = $1', [correo]);
+        if (userRes.rows.length === 0) return res.status(404).json({ message: 'Correo no registrado' });
+
+        const usuarioId = userRes.rows[0].id;
+
+        // 2. Asignar el usuario a la unidad
+        await pool.query(
+            'UPDATE unidades SET usuario_id = $1 WHERE id = $2', 
+            [usuarioId, unidad_id]
+        );
+
+        res.json({ message: 'Vínculo exitoso' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+};
+
+// Ejemplo de lógica para el botón Vincular
+export const asignarUnidad = async (req, res) => {
+    const { correo, unidad_id } = req.body;
+    try {
+        // 1. Buscamos al usuario por correo
+        const user = await pool.query('SELECT id FROM usuarios WHERE correo = $1', [correo]);
+        if (user.rows.length === 0) return res.status(404).json({ message: "Usuario no encontrado" });
+
+        // 2. Actualizamos la unidad (El Trigger que creamos protegerá esta operación)
+        await pool.query(
+            'UPDATE unidades SET usuario_id = $1 WHERE id = $2',
+            [user.rows[0].id, unidad_id]
+        );
+
+        res.json({ message: "Propietario vinculado con éxito" });
+    } catch (error) {
+        // Si el Trigger salta, el error llegará aquí
+        res.status(400).json({ message: error.message });
     }
 };
