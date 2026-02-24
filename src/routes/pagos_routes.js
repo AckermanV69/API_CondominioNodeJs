@@ -1,22 +1,11 @@
-import { Router } from 'express';
-import { 
-    registrarPago, 
-    generarCargaComun, 
-    generarCargaEspecial,
-    generarCargaMasiva,
-    historialPagos,
-    unidadesPropietario
-} from '../controllers/pagosController.js';
+import { Router } from "express";
+import { authRequired } from "../middlewares/authRequired.js";
+import { registrarPago, historialPagos, pagosPendientes } from "../controllers/pagosController.js";
 
 const router = Router();
 
-router.post("/", registrarPago);
-router.post("/registrar", registrarPago);
-router.get("/historial", historialPagos);
-router.get("/unidades/propietario/:email", unidadesPropietario);
-
-router.post("/carga-comun", generarCargaComun);
-router.post("/carga-especial", generarCargaEspecial);
-router.post("/carga-masiva", generarCargaMasiva);
+router.post("/", authRequired, registrarPago);
+router.get("/historial", authRequired, historialPagos);
+router.get("/pendientes", authRequired, pagosPendientes);
 
 export default router;

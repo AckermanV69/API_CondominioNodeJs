@@ -1,208 +1,301 @@
 import { pool } from "../config/db.js";
 
+const normalize = (v) => String(v || "").trim().toLowerCase();
+
 export const registrarPago = async (req, res) => {
-    const { telefono, referencias, referencia, cedula, monto, fecha, correo, email, banco } = req.body;
-    const mail = (correo || email || '').trim().toLowerCase();
-    const ref = (referencias || referencia || '').trim();
+  const mail = normalize(req.user?.email);
+  if (!mail) return res.status(401).json({ message: "Token sin email" });
 
-    if (!mail || !ref || !monto) {
-        return res.status(400).json({ message: "Faltan correo, referencia o monto." });
+  const { telefono, referencia, cedula, monto, banco, deuda_id } = req.body;
+
+  const ref = String(referencia || "").trim();
+  const tel = telefono ? String(telefono).trim() : null;
+  const ci = cedula ? String(cedula).trim() : null;
+  const bancoVal = banco ? String(banco).trim() : null;
+
+  const montoNum = Number(monto);
+  const deudaId = Number(deuda_id);
+
+  if (!ref || !Number.isFinite(montoNum) || montoNum <= 0) {
+    return res.status(400).json({ message: "Faltan referencia o monto válido." });
+  }
+  if (!Number.isFinite(deudaId) || deudaId <= 0) {
+    return res.status(400).json({ message: "deuda_id inválido (requerido)" });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // 0) Lock deuda + domicilio (sin outer join)
+    const dLock = await client.query(
+      `
+      SELECT
+        d.id_deuda,
+        d.monto_deuda,
+        d.tipo_moneda,
+        d.is_active,
+        d.id_domicilio_id,
+        dom.id_condominio_id,
+        dom.id_propietario_id
+      FROM deudas d
+      JOIN domicilio dom ON dom.id_domicilio = d.id_domicilio_id
+      WHERE d.id_deuda = $1
+      FOR UPDATE
+      `,
+      [deudaId]
+    );
+
+    if (!dLock.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Deuda no encontrada" });
     }
 
+    const deuda = dLock.rows[0];
+
+    if (!deuda.is_active) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "La deuda no está activa (ya pagada/inactiva)" });
+    }
+
+    // 0.1) Validar dueño por email (propietario -> usuarios)
+    const ownerQ = await client.query(
+      `
+      SELECT
+        p.id_propietario,
+        u.email AS email_usuario
+      FROM domicilio dom
+      LEFT JOIN propietario p ON p.id_propietario = dom.id_propietario_id
+      LEFT JOIN usuarios u ON u.id = p.id_usuario_id
+      WHERE dom.id_domicilio = $1
+      LIMIT 1
+      `,
+      [deuda.id_domicilio_id]
+    );
+
+    const owner = ownerQ.rows[0] || {};
+    if (owner.email_usuario && normalize(owner.email_usuario) !== mail) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ message: "La deuda no pertenece a este usuario" });
+    }
+
+    const tipoMoneda =
+      deuda.tipo_moneda && String(deuda.tipo_moneda).trim()
+        ? String(deuda.tipo_moneda).trim()
+        : "USD";
+
+    // 1) Insertar movimiento (pendiente)
+    const movQ = await client.query(
+      `
+      INSERT INTO movimientos (
+        fecha_movimiento,
+        descripcion_movimiento,
+        referencia_movimiento,
+        debito_movimiento,
+        credito_movimiento,
+        monto_movimiento,
+        estado_movimiento,
+        tipo_moneda,
+        concepto_movimiento,
+        banco_emisor,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        CURRENT_DATE,
+        $1,
+        $2,
+        0,
+        $3,
+        $3,
+        0,              -- 0 = pendiente
+        $4,
+        $5,
+        $6,
+        NOW(),
+        NOW()
+      )
+      RETURNING id_movimiento;
+      `,
+      [
+        `Pago reportado por propietario (deuda #${deudaId})`,
+        ref,
+        montoNum,
+        tipoMoneda,
+        "PAGO_DEUDA",
+        bancoVal,
+      ]
+    );
+
+    const idMovimiento = movQ.rows[0].id_movimiento;
+
+    // 2) datos_transaccion
+    await client.query(
+      `
+      INSERT INTO datos_transaccion (
+        nombre_titular,
+        telefono_titular,
+        correo_titular,
+        dni_titular,
+        codigo_area,
+        tipo_transaccion,
+        id_movimiento_id
+      )
+      VALUES ($1, $2, $3, $4, NULL, $5, $6)
+      `,
+      [mail, tel, mail, ci, "PAGO", idMovimiento]
+    );
+
+    // 3) recibo pendiente
+    const recQ = await client.query(
+      `
+      INSERT INTO recibos (
+        descripcion_recibo,
+        monto,
+        fecha_creacion,
+        hora_creacion,
+        id_deuda_id,
+        categoria_recibo,
+        id_movimiento_id
+      )
+      VALUES ($1, $2, CURRENT_DATE, CURRENT_TIME, $3, 'PENDIENTE', $4)
+      RETURNING *;
+      `,
+      [
+        `Reporte pendiente de pago deuda #${deudaId} (ref: ${ref})`,
+        montoNum,
+        deudaId,
+        idMovimiento,
+      ]
+    );
+
+    // 4) ingresos: link movimiento ↔ propietario
+    if (owner.id_propietario) {
+      await client.query(
+        `
+        INSERT INTO ingresos (
+          tipo_ingreso,
+          imagen_referencial,
+          id_movimiento_id,
+          id_propietario_id,
+          factura,
+          metodo_pago
+        )
+        VALUES ($1, NULL, $2, $3, NULL, NULL)
+        `,
+        ["PAGO", idMovimiento, owner.id_propietario]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return res.status(201).json({
+      message: "✅ Pago reportado. Queda pendiente de aprobación.",
+      id_movimiento: idMovimiento,
+      recibo: recQ.rows[0],
+    });
+  } catch (error) {
     try {
-        const result = await pool.query(
-            `INSERT INTO pagos (usuario_email, telefono, referencia, cedula, monto, fecha_pago, banco, estado) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pendiente') RETURNING *`,
-            [mail, (telefono || '').trim(), ref, (cedula || '').trim(), parseFloat(monto), fecha || null, banco || null]
-        );
-
-        res.status(201).json({
-            message: "Pago registrado exitosamente",
-            pago: result.rows[0]
-        });
-    } catch (error) {
-        console.error("Error al registrar pago:", error);
-        
-        // Manejo de referencia duplicada
-        if (error.code === '23505') {
-            return res.status(400).json({ message: "Este número de referencia ya fue registrado anteriormente." });
-        }
-
-        res.status(500).json({ message: "Error interno al procesar el pago" });
-    }
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("registrarPago:", error);
+    return res.status(500).json({ message: "Error interno al procesar el pago" });
+  } finally {
+    client.release();
+  }
 };
 
-// CARGA COMÚN: Para todos los del edificio (frontend: condominio, monto, descripcion, tipo)
-export const generarCargaComun = async (req, res) => {
-    const { condominio, nombreCondominio, monto, descripcion, tipo } = req.body;
-    const nombreCondo = (condominio || nombreCondominio || '').trim();
-    if (!nombreCondo || !monto || monto <= 0) {
-        return res.status(400).json({ message: "Faltan condominio o monto válido." });
-    }
-    try {
-        const condo = await pool.query(
-            "SELECT id FROM condominios WHERE nombre = $1",
-            [nombreCondo]
-        );
-        if (condo.rows.length === 0) {
-            return res.status(404).json({ message: "Condominio no encontrado." });
-        }
-        const condominioId = condo.rows[0].id;
-
-        const usuarios = await pool.query(
-            `SELECT DISTINCT u.id, u.condominio_id 
-             FROM usuarios u 
-             JOIN condominios c ON u.condominio_id = c.id 
-             WHERE c.nombre = $1
-             UNION
-             SELECT DISTINCT us.id, un.condominio_id
-             FROM unidades un
-             JOIN usuarios us ON un.usuario_id = us.id
-             JOIN condominios c ON c.id = un.condominio_id
-             WHERE c.nombre = $1`,
-            [nombreCondo, nombreCondo]
-        );
-
-        if (usuarios.rows.length === 0) {
-            return res.status(404).json({ message: "No hay propietarios en este condominio." });
-        }
-
-        const promesas = usuarios.rows.map(user => {
-            return pool.query(
-                `INSERT INTO pagos (usuario_id, condominio_id, monto, descripcion, tipo_pago, estado) 
-                 VALUES ($1, $2, $3, $4, $5, 'pendiente')`,
-                [user.id, condominioId, parseFloat(monto), descripcion || null, tipo || 'mensualidad']
-            );
-        });
-        await Promise.all(promesas);
-        res.status(201).json({ message: `Carga generada para ${usuarios.rows.length} propietarios.` });
-    } catch (error) {
-        console.error("generarCargaComun:", error);
-        res.status(500).json({ error: error.message });
-    }
-};
-
-export const generarCargaMasiva = async (req, res) => {
-    const { condominio, monto, descripcion, tipo } = req.body;
-
-    try {
-        // 1. Buscamos a todos los usuarios vinculados a ese condominio
-        const usuarios = await pool.query(
-            `SELECT u.id, u.condominio_id 
-             FROM usuarios u 
-             JOIN condominios c ON u.condominio_id = c.id 
-             WHERE c.nombre = $1`, 
-            [condominio]
-        );
-
-        if (usuarios.rows.length === 0) {
-            return res.status(404).json({ message: "No hay propietarios registrados en este edificio." });
-        }
-
-        const condominioId = usuarios.rows[0].condominio_id;
-
-        // 2. Insertamos el pago para cada usuario encontrado
-        // Usamos una promesa múltiple para mayor velocidad
-        const promesas = usuarios.rows.map(user => {
-            return pool.query(
-                `INSERT INTO pagos (usuario_id, condominio_id, monto, descripcion, tipo_pago, estado) 
-                 VALUES ($1, $2, $3, $4, $5, 'pendiente')`,
-                [user.id, condominioId, monto, descripcion, tipo]
-            );
-        });
-
-        await Promise.all(promesas);
-
-        res.status(201).json({ 
-            message: `Carga de tipo ${tipo} realizada a ${usuarios.rows.length} usuarios.` 
-        });
-
-    } catch (error) {
-        console.error("Error en carga masiva:", error);
-        res.status(500).json({ message: "Error interno del servidor" });
-    }
-};
-
-export const generarCargaEspecial = async (req, res) => {
-    const { correo, monto, descripcion, tipo, unidad_id } = req.body;
-    const mail = (correo || '').trim().toLowerCase();
-    if (!mail || !monto || monto <= 0) {
-        return res.status(400).json({ message: "Faltan correo o monto válido." });
-    }
-
-    try {
-        const usuarioQuery = await pool.query(
-            "SELECT id, condominio_id FROM usuarios WHERE correo = $1",
-            [mail]
-        );
-        if (usuarioQuery.rowCount === 0) {
-            return res.status(404).json({ message: "Usuario no encontrado" });
-        }
-        const { id, condominio_id } = usuarioQuery.rows[0];
-
-        let nombreUnidad = null;
-        if (unidad_id) {
-            const un = await pool.query(
-                "SELECT nombre_unidad FROM unidades WHERE id = $1 AND usuario_id = $2",
-                [unidad_id, id]
-            );
-            if (un.rows.length) nombreUnidad = un.rows[0].nombre_unidad;
-        }
-
-        await pool.query(
-            `INSERT INTO pagos (usuario_id, condominio_id, monto, descripcion, tipo_pago, estado, nombre_unidad) 
-             VALUES ($1, $2, $3, $4, $5, 'pendiente', $6)`,
-            [id, condominio_id, parseFloat(monto), descripcion || null, tipo || 'especial', nombreUnidad]
-        );
-
-        res.status(201).json({ message: "Carga individual realizada con éxito" });
-    } catch (error) {
-        console.error("Error en carga especial:", error);
-        res.status(500).json({ message: "Error interno del servidor" });
-    }
-};
-
-// GET /pagos/historial?correo=... (Frontend: Firstpage)
 export const historialPagos = async (req, res) => {
-    const { correo } = req.query;
-    if (!correo) {
-        return res.status(400).json({ message: "Falta parámetro correo." });
-    }
-    try {
-        const result = await pool.query(
-            `SELECT p.id, p.monto, p.referencia, p.estado, p.banco AS metodo, p.fecha_pago AS fecha,
-                    TO_CHAR(p.fecha_pago, 'DD/MM/YYYY') AS fecha_formateada
-             FROM pagos p
-             WHERE p.usuario_email = $1 AND p.referencia IS NOT NULL AND p.referencia != '0'
-             ORDER BY p.fecha_pago DESC, p.created_at DESC`,
-            [(correo || '').trim().toLowerCase()]
-        );
-        res.json(result.rows);
-    } catch (error) {
-        console.error("historialPagos:", error);
-        res.status(500).json({ message: "Error al obtener historial" });
-    }
+  const mail = normalize(req.user?.email);
+  if (!mail) return res.status(401).json({ message: "Token sin email" });
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        m.id_movimiento,
+        m.fecha_movimiento,
+        m.descripcion_movimiento,
+        m.referencia_movimiento,
+        m.monto_movimiento,
+        m.estado_movimiento,
+        m.tipo_moneda,
+        m.banco_emisor,
+        m.created_at,
+
+        dt.id_transaccion,
+        dt.tipo_transaccion,
+        dt.nombre_titular,
+        dt.correo_titular,
+        dt.dni_titular,
+
+        r.id_recibo,
+        r.id_deuda_id,
+        r.categoria_recibo
+      FROM movimientos m
+      JOIN LATERAL (
+        SELECT *
+        FROM datos_transaccion dt
+        WHERE dt.id_movimiento_id = m.id_movimiento
+          AND LOWER(dt.correo_titular) = $1
+        ORDER BY dt.id_transaccion DESC
+        LIMIT 1
+      ) dt ON true
+      LEFT JOIN recibos r ON r.id_movimiento_id = m.id_movimiento
+      ORDER BY m.fecha_movimiento DESC NULLS LAST, m.created_at DESC, m.id_movimiento DESC
+      `,
+      [mail]
+    );
+
+    return res.json(result.rows);
+  } catch (error) {
+    console.error("historialPagos:", error);
+    return res.status(500).json({ message: "Error al obtener historial" });
+  }
 };
 
-// GET /pagos/unidades/propietario/:email (Frontend: CargarMensualidad) – mismo formato que /unidades/usuario-completo
-export const unidadesPropietario = async (req, res) => {
-    const { email } = req.params;
-    if (!email) {
-        return res.status(400).json({ message: "Falta email." });
-    }
-    try {
-        const result = await pool.query(
-            `SELECT u.id, u.nombre_unidad, c.nombre AS nombre_condominio
-             FROM unidades u
-             JOIN condominios c ON u.condominio_id = c.id
-             JOIN usuarios us ON u.usuario_id = us.id
-             WHERE us.correo = $1
-             ORDER BY c.nombre, u.nombre_unidad ASC`,
-            [(email || '').trim().toLowerCase()]
-        );
-        res.json(result.rows);
-    } catch (error) {
-        console.error("unidadesPropietario:", error);
-        res.status(500).json({ message: "Error al obtener unidades" });
-    }
+export const pagosPendientes = async (req, res) => {
+  const mail = normalize(req.user?.email);
+  if (!mail) return res.status(401).json({ message: "Token sin email" });
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        m.id_movimiento,
+        m.monto_movimiento,
+        m.referencia_movimiento,
+        m.estado_movimiento,
+        m.fecha_movimiento,
+        m.banco_emisor,
+        m.created_at,
+
+        dt.id_transaccion,
+        dt.correo_titular,
+
+        r.id_recibo,
+        r.id_deuda_id,
+        r.categoria_recibo
+      FROM movimientos m
+      JOIN LATERAL (
+        SELECT *
+        FROM datos_transaccion dt
+        WHERE dt.id_movimiento_id = m.id_movimiento
+          AND LOWER(dt.correo_titular) = $1
+        ORDER BY dt.id_transaccion DESC
+        LIMIT 1
+      ) dt ON true
+      LEFT JOIN recibos r ON r.id_movimiento_id = m.id_movimiento
+      WHERE m.estado_movimiento = 0
+      ORDER BY m.created_at DESC, m.id_movimiento DESC
+      `,
+      [mail]
+    );
+
+    return res.json(result.rows);
+  } catch (error) {
+    console.error("pagosPendientes:", error);
+    return res.status(500).json({ message: "Error al obtener pagos pendientes" });
+  }
 };

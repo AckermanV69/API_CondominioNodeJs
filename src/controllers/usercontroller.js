@@ -1,463 +1,309 @@
 import { pool } from "../config/db.js";
+import argon2 from "argon2";
 
-// Obtener todos los usuarios
-export const usersget = async(req, res) => {
-    try {
-        const { rows } = await pool.query('SELECT * FROM usuarios');
-        res.json(rows);
-    } catch (error) {
-        res.status(500).json({ error: "Error al obtener usuarios" });
-    }
+const normalizeEmail = (v) => String(v || "").trim().toLowerCase();
+
+async function getRoleNameById(roleId) {
+  try {
+    if (roleId == null) return null;
+    const q = await pool.query("SELECT name FROM roles WHERE id_rol = $1", [roleId]);
+    if (q.rowCount) return String(q.rows[0].name || "").toLowerCase();
+  } catch (e) {
+    console.error("getRoleNameById error:", e);
+  }
+  return String(roleId ?? "");
 }
 
-// Obtener usuario por ID
-export const usersgetid = async(req, res) => {
-    try {
-        const { id } = req.params;
-        const { rows } = await pool.query('SELECT * FROM usuarios WHERE id = $1', [id]);
-        
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'Usuario no encontrado' });
-        }
-        res.json(rows[0]);
-    } catch (error) {
-        res.status(500).json({ error: 'Error al obtener el usuario' });
-    }
+// Devuelve user en formato que espera el front:
+// { id, correo, nombre, rol, condominio_id, rol_id }
+function mapUserForFront(row, rolNombre) {
+  return {
+    id: row.id,
+    correo: row.email,
+    nombre: row.username,
+    rol: rolNombre ?? null,
+    condominio_id: row.id_condominio_id ?? null,
+    rol_id: row.id_rol_id ?? null,
+  };
 }
 
-// Obtener usuario por correo (Frontend: AddPropietario)
-export const usersgetByEmail = async (req, res) => {
-    try {
-        const { email } = req.params;
-        const correo = (email || '').trim().toLowerCase();
-        const { rows } = await pool.query(
-            'SELECT id, nombre, correo, rol, condominio_id FROM usuarios WHERE correo = $1',
-            [correo]
-        );
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'Usuario no encontrado' });
-        }
-        res.json(rows[0]);
-    } catch (error) {
-        res.status(500).json({ error: 'Error al obtener el usuario' });
-    }
+function isArgonHash(v) {
+  return typeof v === "string" && v.startsWith("argon2$");
 }
 
-// Eliminar usuario
-export const usersdelete = async(req, res) => {
+/**
+ * Verifica password:
+ * - si es argon2$... usa argon2.verify
+ * - si es legacy plaintext (ej "mu123456") compara directo y MIGRA a argon2 al login OK
+ */
+async function verifyAndMaybeMigratePassword(userId, storedPassword, plainPassword) {
+  const stored = String(storedPassword || "");
+  const plain = String(plainPassword || "");
+
+  if (!stored || !plain) return false;
+
+  // Argon2 hash
+  if (isArgonHash(stored)) {
+    return await argon2.verify(stored, plain);
+  }
+
+  // Legacy plaintext
+  const ok = stored === plain;
+  if (ok) {
     try {
-        const { id } = req.params;
-        const { rows } = await pool.query('DELETE FROM usuarios WHERE id = $1 RETURNING *', [id]);
-        
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'Usuario no encontrado' });
-        }
-        res.json({ message: "Usuario eliminado", usuario: rows[0] });
-    } catch (error) {
-        res.status(500).json({ error: "Error al eliminar" });
+      const newHash = await argon2.hash(plain);
+      await pool.query("UPDATE usuarios SET password = $1 WHERE id = $2", [newHash, userId]);
+    } catch (e) {
+      console.error("Password migration error:", e);
+      // aunque falle migración, el login fue correcto
     }
+  }
+  return ok;
 }
 
-// Actualizar usuario
-export const usersput = async(req, res) => {
-    try {
-        const { id } = req.params;
-        const { nombre, correo, password, tlf } = req.body; // Quitamos apellido, añadimos tlf
-
-        const { rows } = await pool.query(
-            'UPDATE usuarios SET nombre = $1, correo = $2, password = $3, tlf = $4 WHERE id = $5 RETURNING *', 
-            [nombre, correo, password, tlf, id]
-        );
-
-        res.json({
-            message: 'Usuario actualizado',
-            usuario: rows[0]
-        });
-    } catch (error) {
-        res.status(500).json({ error: "Error al actualizar" });
-    }
-}
-
-// Login CORREGIDO
-export const loginUsuario = async (req, res) => {
-    // Recibimos 'correo' en lugar de 'email'
-    const { correo, password } = req.body;
-
-    try {
-        // Buscamos en la columna 'correo'
-        const result = await pool.query(
-            "SELECT * FROM usuarios WHERE correo = $1",
-            [correo]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: "Usuario no encontrado" });
-        }
-
-        const user = result.rows[0];
-
-        // Verificación de contraseña (si usas bcrypt, usa bcrypt.compare)
-        if (user.password !== password) {
-            return res.status(401).json({ message: "Contraseña incorrecta" });
-        }
-
-        res.status(200).json({
-            message: "Login exitoso",
-            user: {
-                id: user.id,
-                nombre: user.nombre,
-                rol: user.rol,
-                correo: user.correo
-            }
-        });
-
-    } catch (error) {
-        console.error("Error en el login:", error);
-        res.status(500).json({ message: "Error interno del servidor" });
-    }
+// -----------------------------
+// CRUD básico
+// -----------------------------
+export const usersget = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, email, username, id_condominio_id, id_rol_id
+       FROM usuarios
+       ORDER BY id ASC`
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("usersget error:", error);
+    res.status(500).json({ error: "Error al obtener usuarios" });
+  }
 };
 
+export const usersgetid = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: "ID inválido" });
 
-// Registro CORREGIDO (Frontend: nombre, cedula, telefono, correo, password, rol, condominio_id)
-export const signUpUsuario = async (req, res) => {
-    const { nombre, cedula, correo, password, rol, telefono, deuda, condominio, condominio_id } = req.body;
-    const condId = condominio_id ?? condominio ?? null;
-
-    try {
-        const result = await pool.query(
-            `INSERT INTO usuarios (nombre, cedula, correo, password, rol, telefono, deuda, condominio_id) 
-             VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), $8) RETURNING *`,
-            [nombre?.trim(), cedula?.trim(), (correo || '').trim().toLowerCase(), password, (rol || 'propietario').toLowerCase(), telefono?.trim(), deuda, condId]
-        );
-
-        res.status(201).json({
-            message: "Usuario registrado con éxito",
-            user: result.rows[0]
-        });
-    } catch (error) {
-        console.error("Error en el registro:", error);
-        if (error.code === '23505') {
-            return res.status(400).json({ message: "La cédula o el correo ya están registrados" });
-        }
-        res.status(500).json({ message: "Error interno del servidor" });
-    }
-};
-
-export const getEstadosConCiudades = async (req, res) => {
-    try {
-        const query = `
-            SELECT e.nombre AS estado, array_agg(c.nombre) AS ciudades
-            FROM estados e
-            JOIN ciudades c ON e.id = c.estado_id
-            GROUP BY e.nombre
-        `;
-        const { rows } = await pool.query(query);
-        res.json(rows);
-    } catch (error) {
-        res.status(500).json({ error: "Error al obtener datos geográficos" });
-    }
-};
-
-// Actualizar datos de condominio del usuario
-export const actualizarCondominioUsuario = async (req, res) => {
-    const { correo, apartamento, seccion } = req.body;
-
-    try {
-        // Buscamos por email y actualizamos apartamento y seccion
-        const result = await pool.query(
-            'UPDATE usuarios SET apartamento = $1, seccion = $2 WHERE email = $3 RETURNING *',
-            [apartamento, seccion, correo]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: "El usuario con ese correo no existe." });
-        }
-
-        res.json({
-            message: "Datos actualizados correctamente",
-            usuario: result.rows[0]
-        });
-
-    } catch (error) {
-        console.error("Error al actualizar:", error);
-        res.status(500).json({ message: "Error interno del servidor" });
-    }
-};
-
-// Registrar un pago o carga común (restar a la deuda)
-export const registrarCargaComun = async (req, res) => {
-    const { apartamento, monto } = req.body;
-
-    try {
-        // Buscamos al usuario por su número de apartamento y restamos el monto de su deuda
-        const result = await pool.query(
-            'UPDATE usuarios SET deuda = deuda - $1 WHERE apartamento = $2 RETURNING *',
-            [monto, apartamento]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: "No se encontró ningún usuario en ese apartamento." });
-        }
-
-        res.status(200).json({
-            message: "Deuda actualizada con éxito",
-            usuario: result.rows[0],
-            nuevoSaldo: result.rows[0].deuda
-        });
-
-    } catch (error) {
-        console.error("Error al procesar carga común:", error);
-        res.status(500).json({ message: "Error interno al procesar el pago" });
-    }
-};
-
-// Registrar una carga especial buscando por correo
-export const registrarCargaEspecial = async (req, res) => {
-    const { correo, monto, descripcion, tipo } = req.body;
-
-    try {
-        // 1. Verificamos que el usuario exista
-        const usuarioQuery = await pool.query(
-            "SELECT correo FROM usuarios WHERE correo = $1",
-            [correo]
-        );
-
-        if (usuarioQuery.rowCount === 0) {
-            return res.status(404).json({ message: "Usuario no encontrado" });
-        }
-
-        // 2. Insertamos usando los nombres de columna reales de tu tabla 'pagos'
-        // Dejamos en NULL o vacío los campos de transferencia porque esto es una "Carga" (Deuda), no el pago aún.
-        await pool.query(
-        `INSERT INTO pagos (
-            usuario_email, 
-            monto, 
-            descripcion, 
-            tipo_pago, 
-            estatus,
-            referencia,   -- Agregamos estos para evitar el error NOT NULL
-            telefono,
-            cedula,
-            banco
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [
-            correo,          
-            monto,           
-            descripcion,     
-            tipo,            
-            'pendiente',
-            '0',            // referencia temporal
-            '0',            // telefono temporal
-            '0',            // cedula temporal
-            'PENDIENTE'     // banco temporal
-        ]
+    const q = await pool.query(
+      `SELECT id, email, username, id_condominio_id, id_rol_id
+       FROM usuarios
+       WHERE id = $1`,
+      [id]
     );
 
-        res.status(201).json({ message: "Carga individual realizada con éxito" });
-
-    } catch (error) {
-        console.error("Error detallado:", error);
-        res.status(500).json({ message: "Error al registrar en la base de datos" });
-    }
+    if (q.rowCount === 0) return res.status(404).json({ error: "Usuario no encontrado" });
+    res.json(q.rows[0]);
+  } catch (error) {
+    console.error("usersgetid error:", error);
+    res.status(500).json({ error: "Error al obtener el usuario" });
+  }
 };
 
-export const updateUsuarioCondominio = async (req, res) => {
-    // Recibimos 'correo' y 'condominio_id' desde el celular
-    const { correo, condominio_id } = req.body;
+// Obtener usuario por correo (útil para tu front)
+export const usersgetByEmail = async (req, res) => {
+  try {
+    const correo = normalizeEmail(req.params.email);
 
-    try {
-        // CAMBIO CLAVE: Usamos la columna 'correo' en el WHERE, no 'email'
-        const result = await pool.query(
-            "UPDATE usuarios SET condominio_id = $1 WHERE correo = $2 RETURNING *",
-            [condominio_id, correo]
-        );
+    const q = await pool.query(
+      `SELECT id, email, username, id_condominio_id, id_rol_id
+       FROM usuarios
+       WHERE LOWER(email) = $1
+       LIMIT 1`,
+      [correo]
+    );
 
-        if (result.rowCount === 0) {
-            return res.status(404).json({ message: "Usuario no encontrado con ese correo." });
-        }
+    if (q.rowCount === 0) return res.status(404).json({ error: "Usuario no encontrado" });
 
-        res.status(200).json({ 
-            message: "Propietario vinculado exitosamente",
-            usuario: result.rows[0] 
-        });
+    const userRow = q.rows[0];
+    const rolNombre = await getRoleNameById(userRow.id_rol_id);
 
-    } catch (error) {
-        console.error("Error al actualizar:", error);
-        res.status(500).json({ message: "Error al actualizar en la base de datos" });
-    }
+    res.json(mapUserForFront(userRow, rolNombre));
+  } catch (error) {
+    console.error("usersgetByEmail error:", error);
+    res.status(500).json({ error: "Error al obtener el usuario" });
+  }
 };
 
-export const registrarCargaEspecialUnidad = async (req, res) => {
-    // El frontend ahora debe enviar el ID de la unidad
-    const { unidad_id, monto, descripcion, tipo } = req.body;
+export const usersdelete = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: "ID inválido" });
 
-    try {
-        // 1. Buscamos la unidad para obtener el email del dueño y el condominio
-        const unidadQuery = await pool.query(
-            `SELECT u.nombre_unidad, u.condominio_id, us.correo 
-             FROM unidades u 
-             JOIN usuarios us ON u.usuario_id = us.id 
-             WHERE u.id = $1`,
-            [unidad_id]
-        );
+    const q = await pool.query(
+      "DELETE FROM usuarios WHERE id = $1 RETURNING id, email, username, id_condominio_id, id_rol_id",
+      [id]
+    );
 
-        if (unidadQuery.rowCount === 0) {
-            return res.status(404).json({ message: "Unidad no encontrada" });
-        }
+    if (q.rowCount === 0) return res.status(404).json({ error: "Usuario no encontrado" });
 
-        const { nombre_unidad, condominio_id, correo } = unidadQuery.rows[0];
-
-        // 2. Insertamos el pago vinculado a esa unidad específica
-        await pool.query(
-            `INSERT INTO pagos (
-                usuario_email, monto, descripcion, tipo_pago, 
-                estatus, referencia, telefono, cedula, banco, nombre_unidad
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-            [
-                correo, monto, descripcion, tipo, 
-                'pendiente', '0', '0', '0', 'PENDIENTE', nombre_unidad
-            ]
-        );
-
-        // 3. (Opcional) Actualizamos la deuda_actual en la tabla unidades
-        await pool.query(
-            "UPDATE unidades SET deuda_actual = deuda_actual + $1 WHERE id = $2",
-            [monto, unidad_id]
-        );
-
-        res.status(201).json({ message: `Carga aplicada con éxito a la unidad ${nombre_unidad}` });
-
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: "Error al registrar carga por unidad" });
-    }
+    res.json({ message: "Usuario eliminado", usuario: q.rows[0] });
+  } catch (error) {
+    console.error("usersdelete error:", error);
+    res.status(500).json({ error: "Error al eliminar" });
+  }
 };
 
-// 1. Asignar unidad (Vincula un usuario a una unidad de un condominio específico)
-export const asignarUnidadPropietario = async (req, res) => {
-    const { usuario_id, unidad_id } = req.body;
+export const usersput = async (req, res) => {
+  // Actualiza username/email/rol/condominio (si los mandas)
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ message: "ID inválido" });
 
-    try {
-        const result = await pool.query(
-            "UPDATE unidades SET usuario_id = $1 WHERE id = $2 RETURNING *",
-            [usuario_id, unidad_id]
-        );
+    const { username, nombre, email, correo, id_rol_id, id_condominio_id } = req.body;
 
-        if (result.rowCount === 0) {
-            return res.status(404).json({ message: "Unidad no encontrada" });
-        }
+    const nextUsername = username ?? nombre ?? null;
+    const nextEmailRaw = email ?? correo ?? null;
+    const nextEmail = nextEmailRaw != null ? normalizeEmail(nextEmailRaw) : null;
 
-        res.status(200).json({ message: "Unidad asignada con éxito", unidad: result.rows[0] });
-    } catch (error) {
-        res.status(500).json({ error: "Error al asignar unidad" });
+    const updates = [];
+    const values = [];
+    let i = 1;
+
+    if (nextUsername !== null) {
+      updates.push(`username = $${i++}`);
+      values.push(String(nextUsername).trim());
     }
+
+    if (nextEmail) {
+      updates.push(`email = $${i++}`);
+      values.push(nextEmail);
+    }
+
+    if (id_rol_id !== undefined) {
+      updates.push(`id_rol_id = $${i++}`);
+      values.push(id_rol_id ?? null);
+    }
+
+    if (id_condominio_id !== undefined) {
+      updates.push(`id_condominio_id = $${i++}`);
+      values.push(id_condominio_id ?? null);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ message: "No hay datos para actualizar." });
+    }
+
+    values.push(id);
+
+    const q = await pool.query(
+      `UPDATE usuarios SET ${updates.join(", ")} WHERE id = $${i}
+       RETURNING id, email, username, id_condominio_id, id_rol_id`,
+      values
+    );
+
+    if (q.rowCount === 0) return res.status(404).json({ message: "Usuario no encontrado" });
+
+    const rolNombre = await getRoleNameById(q.rows[0].id_rol_id);
+
+    res.json({
+      message: "Usuario actualizado",
+      user: mapUserForFront(q.rows[0], rolNombre),
+    });
+  } catch (error) {
+    console.error("usersput error:", error);
+
+    if (error.code === "23505") {
+      return res.status(400).json({ message: "El correo ya está registrado." });
+    }
+
+    res.status(500).json({ error: "Error al actualizar" });
+  }
 };
 
-// 2. Modificar/Quitar unidad (Pone el usuario_id en NULL para reasignar)
-export const desvincularUnidad = async (req, res) => {
-    const { unidad_id } = req.body;
+// -----------------------------
+// Login (email/username + password)
+// -----------------------------
+/*export const loginUsuario = async (req, res) => {
+  const { correo, email, username, password } = req.body;
+  const identifier = normalizeEmail(correo ?? email ?? username);
 
-    try {
-        await pool.query(
-            "UPDATE unidades SET usuario_id = NULL WHERE id = $1",
-            [unidad_id]
-        );
-        res.status(200).json({ message: "Unidad liberada correctamente" });
-    } catch (error) {
-        res.status(500).json({ error: "Error al modificar la unidad" });
+  if (!identifier || !password) {
+    return res.status(400).json({ message: "Debe enviar email/correo (o username) y password." });
+  }
+
+  try {
+    const q = await pool.query(
+      `SELECT id, email, username, id_condominio_id, id_rol_id, password, is_active
+       FROM usuarios
+       WHERE LOWER(email) = $1 OR LOWER(username) = $1
+       LIMIT 1`,
+      [identifier]
+    );
+
+    if (q.rowCount === 0) return res.status(404).json({ message: "Usuario no encontrado" });
+
+    const userRow = q.rows[0];
+
+    if (userRow.is_active === false) {
+      return res.status(403).json({ message: "Usuario inactivo" });
     }
-};
 
-// 3. Listar todas las unidades de un usuario (de todos sus condominios)
-export const getUnidadesGlobalesPropietario = async (req, res) => {
-    const { correo } = req.params;
-    try {
-        const query = `
-            SELECT u.id as unidad_id, u.nombre_unidad, c.nombre as nombre_condominio, u.deuda_actual
-            FROM unidades u
-            JOIN usuarios us ON u.usuario_id = us.id
-            JOIN condominios c ON u.condominio_id = c.id
-            WHERE us.correo = $1
-        `;
-        const result = await pool.query(query, [correo]);
-        res.json(result.rows);
-    } catch (error) {
-        res.status(500).json({ error: "Error al obtener historial de unidades" });
+    const ok = await verifyAndMaybeMigratePassword(userRow.id, userRow.password, password);
+    if (!ok) return res.status(401).json({ message: "Contraseña incorrecta" });
+
+    const rolNombre = await getRoleNameById(userRow.id_rol_id);
+
+    return res.status(200).json({
+      message: "Login exitoso",
+      user: mapUserForFront(userRow, rolNombre),
+    });
+  } catch (error) {
+    console.error("Error en loginUsuario:", error);
+    return res.status(500).json({ message: "Error interno del servidor" });
+  }
+};*/
+
+// -----------------------------
+// Signup (crea usuario)
+// -----------------------------
+export const signUpUsuario = async (req, res) => {
+  const { username, nombre, email, correo, password, id_rol_id, id_condominio_id } = req.body;
+
+  const mail = normalizeEmail(email ?? correo);
+  const userName = String(username ?? nombre ?? "").trim();
+
+  if (!mail || !userName || !password) {
+    return res.status(400).json({ message: "Faltan email/correo, username/nombre o password." });
+  }
+
+  try {
+    // evitar duplicado
+    const exists = await pool.query("SELECT 1 FROM usuarios WHERE LOWER(email) = $1 LIMIT 1", [mail]);
+    if (exists.rowCount) {
+      return res.status(400).json({ message: "El correo ya está registrado." });
     }
-};
 
-// En usercontroller.js
-export const getUnidadesLibres = async (req, res) => {
-    const { condominio_id } = req.params;
-    try {
-        const result = await pool.query(
-            "SELECT id, nombre_unidad FROM unidades WHERE condominio_id = $1 AND usuario_id IS NULL",
-            [condominio_id]
-        );
-        res.json(result.rows);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+    // rol
+    let roleIdFinal = id_rol_id ?? 2;
+
+    // validar rol (si existe tabla roles)
+    const roleCheck = await pool.query("SELECT 1 FROM roles WHERE id_rol = $1", [roleIdFinal]);
+    if (roleCheck.rowCount === 0) {
+      return res.status(400).json({ message: "El rol enviado no existe (id_rol_id inválido)." });
     }
-};
 
-// Esta es la función que invoca AddUsuarioc.js
-export const asignarUnidadPorCorreo = async (req, res) => {
-    const { correo, unidad_id } = req.body;
-    try {
-        const userQuery = await pool.query("SELECT id FROM usuarios WHERE correo = $1", [correo]);
-        if (userQuery.rowCount === 0) {
-            return res.status(404).json({ message: "El correo no coincide con ningún usuario registrado." });
-        }
-        const usuario_id = userQuery.rows[0].id;
-        const result = await pool.query(
-            "UPDATE unidades SET usuario_id = $1 WHERE id = $2 RETURNING *",
-            [usuario_id, unidad_id]
-        );
-        res.status(200).json({ message: "Unidad asignada", unidad: result.rows[0] });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+    // hash con argon2
+    const hash = await argon2.hash(String(password));
+
+    const q = await pool.query(
+      `INSERT INTO usuarios (email, username, id_condominio_id, id_rol_id, password)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, email, username, id_condominio_id, id_rol_id`,
+      [mail, userName, id_condominio_id ?? null, roleIdFinal, hash]
+    );
+
+    const rolNombre = await getRoleNameById(q.rows[0].id_rol_id);
+
+    return res.status(201).json({
+      message: "Usuario registrado con éxito",
+      user: mapUserForFront(q.rows[0], rolNombre),
+    });
+  } catch (error) {
+    console.error("Error en signUpUsuario:", error);
+
+    if (error.code === "23505") {
+      return res.status(400).json({ message: "El correo ya está registrado." });
     }
-};
 
-// En tu controlador de vinculación (ej: usercontroller.js o unidadescontroller.js)
-export const vincularUnidad = async (req, res) => {
-    const { correo, unidad_id } = req.body;
-    try {
-        // 1. Buscar el ID del usuario por su correo
-        const userRes = await pool.query('SELECT id FROM usuarios WHERE correo = $1', [correo]);
-        if (userRes.rows.length === 0) return res.status(404).json({ message: 'Correo no registrado' });
-
-        const usuarioId = userRes.rows[0].id;
-
-        // 2. Asignar el usuario a la unidad
-        await pool.query(
-            'UPDATE unidades SET usuario_id = $1 WHERE id = $2', 
-            [usuarioId, unidad_id]
-        );
-
-        res.json({ message: 'Vínculo exitoso' });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-};
-
-// Ejemplo de lógica para el botón Vincular
-export const asignarUnidad = async (req, res) => {
-    const { correo, unidad_id } = req.body;
-    try {
-        // 1. Buscamos al usuario por correo
-        const user = await pool.query('SELECT id FROM usuarios WHERE correo = $1', [correo]);
-        if (user.rows.length === 0) return res.status(404).json({ message: "Usuario no encontrado" });
-
-        // 2. Actualizamos la unidad (El Trigger que creamos protegerá esta operación)
-        await pool.query(
-            'UPDATE unidades SET usuario_id = $1 WHERE id = $2',
-            [user.rows[0].id, unidad_id]
-        );
-
-        res.json({ message: "Propietario vinculado con éxito" });
-    } catch (error) {
-        // Si el Trigger salta, el error llegará aquí
-        res.status(400).json({ message: error.message });
-    }
+    return res.status(500).json({ message: "Error interno del servidor" });
+  }
 };

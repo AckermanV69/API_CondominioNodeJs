@@ -1,10 +1,11 @@
 import { Router } from "express";
-import { registrarCondominio, getCondominios, getCondominiosPorAdmin } from "../controllers/condominioController.js";
+import { crearCondominio, getCondominios, registrarCondominioConUnidades, getResumenCondominio, listCondominios } from "../controllers/condominioController.js";
 
 const router = Router();
-router.post("/registrar", registrarCondominio);
-router.get("/lista", getCondominios);
-router.get("/", getCondominiosPorAdmin);
-//router.post("/registrar", registrarPropiedadConUnidades);
 
+router.get("/:id", getCondominios); 
+router.post("/crear", crearCondominio);
+router.post("/registrar", registrarCondominioConUnidades);
+router.get("/:id/resumen", getResumenCondominio);
+router.get("/", listCondominios);
 export default router;

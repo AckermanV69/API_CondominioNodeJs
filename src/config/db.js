@@ -1,24 +1,33 @@
-import pg from 'pg';
-import dotenv from 'dotenv';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import pg from "pg";
+import {
+  DB_HOST,
+  DB_PORT,
+  DB_USER,
+  DB_PASSWORD,
+  DB_NAME,
+  DB_SSL,
+} from "./env.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-dotenv.config({ path: join(__dirname, '../../.env') });
+export const pool = new pg.Pool({
+  host: DB_HOST,
+  port: DB_PORT,
+  user: DB_USER,
+  password: DB_PASSWORD,
+  database: DB_NAME,
+  ssl: DB_SSL ? { rejectUnauthorized: false } : false,
+});
 
-const user = process.env.DB_USER || 'postgres';
-const password = process.env.DB_PASSWORD || 'mu123456';
-const host = process.env.DB_HOST || 'localhost';
-const database = process.env.DB_NAME || 'condo_db';
-const port = parseInt(process.env.DB_PORT || '5432', 10);
+pool.on("connect", async (client) => {
+  try {
+    const r = await client.query(
+      "select current_database() db, inet_server_addr() addr, inet_server_port() port, current_user usr"
+    );
+    console.log("✅ PG:", r.rows[0]);
+  } catch {
+    console.log("✅ PG: conectado");
+  }
+});
 
-if (!password) {
-    console.warn('⚠️ DB_PASSWORD vacío en .env – Verifica que exista .env en la raíz del proyecto y tenga DB_PASSWORD=tu_contraseña');
-}
-
-export const pool = new pg.Pool({ user, host, database, password, port });
-
-pool.on('connect', () => {
-    console.log('✅ Conectado a PostgreSQL');
+pool.on("error", (err) => {
+  console.error("❌ Pool error:", err);
 });
