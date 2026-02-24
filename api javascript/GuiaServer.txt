@@ -1,7 +1,0 @@
-#Server
-
-#paso 1
-cd "direccion de carpeta" ej: cd "C:/Users/marco/Desktop/api javascript"
-
-#paso 2
-npm run dev o npx nodemon src/index.js 
